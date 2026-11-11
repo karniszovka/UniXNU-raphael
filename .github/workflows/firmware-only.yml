@@ -46,6 +46,7 @@ on:
         options: [DEBUG, RELEASE]
 
 permissions:
+  actions: read
   contents: read
 
 jobs:
