@@ -1,8 +1,8 @@
+
 name: firmware-only
 
 # Fast firmware iteration: reuse the SM8150 kernel that the build-raphael
-# workflow already produced instead of rebuilding XNU on the macOS runner
-# (~10 min) for every firmware experiment.
+# workflow already produced instead of rebuilding XNU on the macOS runner.
 
 on:
   workflow_dispatch:
@@ -56,18 +56,120 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # FIXED: Validate the API response, find the artifact, and download it.
       - name: Reuse the kernel built by an earlier run
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KERNEL_RUN_ID: ${{ inputs.kernel_run_id }}
+          REPOSITORY: ${{ github.repository }}
         run: |
+          set -euo pipefail
+
           mkdir -p inputs/raphael
-          curl -sL -H "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ inputs.kernel_run_id }}/artifacts" -o /tmp/arts.json
-          ID=$(python3 -c "import json;print([a['id'] for a in json.load(open('/tmp/arts.json'))['artifacts'] if a['name']=='raphael-kernel'][0])")
-          curl -sL -H "Authorization: Bearer $GH_TOKEN" \
-            "https://api.github.com/repos/${{ github.repository }}/actions/artifacts/$ID/zip" -o /tmp/k.zip
-          python3 -c "import zipfile;zipfile.ZipFile('/tmp/k.zip').extractall('inputs/raphael')"
-          ls -l inputs/raphael
+
+          if [ -z "$KERNEL_RUN_ID" ]; then
+            echo "::error::kernel_run_id is empty"
+            exit 1
+          fi
+
+          echo "Looking for raphael-kernel in run $KERNEL_RUN_ID"
+          echo "Repository: $REPOSITORY"
+
+          API="https://api.github.com/repos/${REPOSITORY}/actions/runs/${KERNEL_RUN_ID}/artifacts"
+
+          curl --fail-with-body --silent --show-error --location \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "$API" \
+            -o /tmp/arts.json
+
+          echo "GitHub artifact API response received."
+
+          python3 - <<'PY'
+          import json
+          import sys
+
+          with open("/tmp/arts.json", encoding="utf-8") as f:
+              data = json.load(f)
+
+          if not isinstance(data, dict) or "artifacts" not in data:
+              print("Unexpected GitHub API response:")
+              print(json.dumps(data, indent=2))
+              sys.exit("Missing 'artifacts' key. Check run ID and permissions.")
+
+          artifacts = data["artifacts"]
+
+          print("Artifacts found:")
+          for artifact in artifacts:
+              print(
+                  f"- {artifact.get('name')} "
+                  f"(expired={artifact.get('expired')}, "
+                  f"id={artifact.get('id')})"
+              )
+
+          matches = [
+              a for a in artifacts
+              if a.get("name") == "raphael-kernel"
+              and not a.get("expired", True)
+          ]
+
+          if not matches:
+              sys.exit(
+                  "No non-expired artifact named 'raphael-kernel' "
+                  "was found in this workflow run."
+              )
+
+          artifact_id = matches[0].get("id")
+
+          if not artifact_id:
+              sys.exit("The matching artifact has no ID.")
+
+          with open("/tmp/artifact_id", "w", encoding="utf-8") as f:
+              f.write(str(artifact_id))
+
+          print(f"Selected raphael-kernel artifact ID: {artifact_id}")
+          PY
+
+          ID=$(cat /tmp/artifact_id)
+
+          echo "Downloading artifact ID $ID"
+
+          curl --fail-with-body --silent --show-error --location \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${REPOSITORY}/actions/artifacts/${ID}/zip" \
+            -o /tmp/k.zip
+
+          python3 - <<'PY'
+          import zipfile
+          import sys
+
+          archive = "/tmp/k.zip"
+          destination = "inputs/raphael"
+
+          if not zipfile.is_zipfile(archive):
+              sys.exit("Downloaded artifact is not a valid ZIP archive.")
+
+          with zipfile.ZipFile(archive) as z:
+              bad_file = z.testzip()
+              if bad_file:
+                  sys.exit(f"Corrupt file inside artifact: {bad_file}")
+              z.extractall(destination)
+
+          print("Artifact extracted successfully.")
+          PY
+
+          echo "Downloaded kernel files:"
+          ls -lah inputs/raphael
+
+          if [ ! -s inputs/raphael/kernel.macho ]; then
+            echo "::error::kernel.macho is missing or empty after extraction"
+            exit 1
+          fi
+
+          echo "Kernel artifact is ready."
 
       - name: Checkout UniXNU driver (pinned)
         uses: actions/checkout@v4
@@ -93,17 +195,30 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build uuid-dev bison flex nasm iasl gcc g++ python3-dev clang lld llvm mtools unzip zip
+
           for t in clang lld-link llvm-lib llvm-rc; do
-            if command -v "$t" >/dev/null 2>&1; then echo "have $t"; continue; fi
+            if command -v "$t" >/dev/null 2>&1; then
+              echo "have $t"
+              continue
+            fi
+
             cand=$(ls /usr/lib/llvm-*/bin/"$t" /usr/bin/"$t"-* 2>/dev/null | sort -V | tail -1)
-            if [ -n "$cand" ]; then sudo ln -sf "$cand" "/usr/local/bin/$t"; echo "linked $t -> $cand"; else echo "MISSING $t"; fi
+
+            if [ -n "$cand" ]; then
+              sudo ln -sf "$cand" "/usr/local/bin/$t"
+              echo "linked $t -> $cand"
+            else
+              echo "MISSING $t"
+            fi
           done
+
           command -v clang lld-link llvm-lib llvm-rc
 
       - name: Apply the SM8150 patches (vendored in this repo)
         run: |
           # NOTE: `git -C <dir> apply` resolves the patch path relative to <dir>.
           git -C unixnu apply ../patches/unixnu-guacamole.patch
+
           # aloha-guacamole.patch was generated against one revision of the tree.
           # Newer/older releases move the context of two of its hunks, and git
           # apply is all-or-nothing, so one stale hunk used to kill the build.
@@ -112,15 +227,21 @@ jobs:
           # re-does them without needing any context.
           git -C uefi apply --reject --whitespace=nowarn ../patches/aloha-guacamole.patch \
             || echo "NOTE: some aloha hunks were rejected (see *.rej) - re-applying below"
+
           python3 scripts/fix_aloha_tree.py uefi
+
           find uefi -name '*.rej' -exec sh -c 'echo "--- REJECTED: $1"; cat "$1"' _ {} \; || true
+
           # Same story for the submodule list: `git submodule update --init --
           # <paths>` aborts on the first path this revision does not have.
           python3 scripts/prune_submodules.py uefi board.toml
+
           # drivers/DarwinBoot is a SUBMODULE OF UniXNU, not of the Aloha tree
           git -C unixnu/drivers/DarwinBoot apply ../../../patches/darwinboot-guacamole.patch
+
           sed -i 's|^TARGET_DEVICE = .*|TARGET_DEVICE = "${{ inputs.device }}"|' board.toml
           grep -n 'TARGET_DEVICE' board.toml
+
           # board.toml keeps FDT = raphael.dtb (the real K20 Pro hardware tree),
           # so the platform looks for Device/<device>/DeviceTreeBlob/*/…-raphael.dtb
           # even when TARGET_DEVICE is a sibling. Supply those names: the Android
@@ -128,14 +249,18 @@ jobs:
           if [ "${{ inputs.device }}" != "xiaomi-raphael" ]; then
             SRC=uefi/Platforms/SurfaceDuo1Pkg/Device/xiaomi-raphael/DeviceTreeBlob
             DST=uefi/Platforms/SurfaceDuo1Pkg/Device/${{ inputs.device }}/DeviceTreeBlob
+
             cp "$SRC/Android/android-raphael.dtb" "$DST/Android/android-raphael.dtb"
             cp "$SRC/Linux/linux-raphael.dtb" "$DST/Linux/linux-raphael.dtb"
+
             ls -l "$DST/Android" "$DST/Linux"
           fi
+
           if [ "${{ inputs.variant }}" = "bootshim_upstream" ]; then
             git -C uefi checkout -- BootShim/BootShim.S
             echo "variant: BootShim.S reverted to upstream (no DTB-pointer store)"
           fi
+
           # The vendored patches were written for oneplus-guacamole, so they add
           # the UniXNU/DarwinBoot drivers to Device/oneplus-guacamole/*. raphael
           # compiles Device/xiaomi-raphael/*, which the patch never touches -
@@ -143,6 +268,7 @@ jobs:
           # never boot XNU. Append the same modules to raphael's own files.
           if [ "${{ inputs.variant }}" != "no_darwinboot" ]; then
             DEV=uefi/Platforms/SurfaceDuo1Pkg/Device/${{ inputs.device }}
+
             cat >> "$DEV/DXE.dsc.inc" <<'DSC'
 
           # UniXNU / DarwinBoot (appended for xiaomi-raphael)
@@ -163,6 +289,7 @@ jobs:
               FdtLib|MdePkg/Library/BaseFdtLib/BaseFdtLib.inf
           }
           DSC
+
             cat >> "$DEV/DXE.inc" <<'FDF'
 
           # UniXNU / DarwinBoot (appended for xiaomi-raphael)
@@ -171,8 +298,10 @@ jobs:
           INF DarwinBootPkg/Driver/DarwinBoot.inf
           INF AndromedaPkg/Driver/ShengBootMemoryDxe/ShengBootMemoryDxe.inf
           FDF
+
             echo "variant: UniXNU/DarwinBoot appended to $DEV"
-            tail -6 "$DEV/DXE.dsc.inc"; tail -6 "$DEV/DXE.inc"
+            tail -6 "$DEV/DXE.dsc.inc"
+            tail -6 "$DEV/DXE.inc"
           else
             echo "variant: UniXNU/DarwinBoot NOT added (plain Aloha UEFI)"
           fi
@@ -187,8 +316,11 @@ jobs:
         run: |
           DEST=uefi/MU_BASECORE/CryptoPkg/Binaries/edk2-basecrypto-driver-bin_extdep
           mkdir -p "$DEST"
-          curl -sL -o /tmp/cryptobin.zip \
+
+          curl --fail-with-body --silent --show-error --location \
+            -o /tmp/cryptobin.zip \
             https://github.com/microsoft/mu_crypto_release/releases/download/v1.1.3/Mu_CryptoBin_v1_1_3.zip
+
           unzip -q -o /tmp/cryptobin.zip -d "$DEST"
           ls -l "$DEST/Driver/Bin/CryptoDriver.inc.dsc"
 
@@ -201,20 +333,25 @@ jobs:
           # standard so the firmware step sees bin/GenFw and skips its own
           # (flag-less) build.
           if [ -f uefi/MU_BASECORE/BaseTools/Source/C/bin/GenFw ]; then
-            echo "host tools already present"; exit 0
+            echo "host tools already present"
+            exit 0
           fi
+
           # The PCCTS sub-directories build with their own makefile and their
           # own CFLAGS, so EXTRA_OPTFLAGS never reaches them. Put a compiler
           # wrapper on PATH instead: every cc/gcc invocation, at any depth,
           # then gets an older C standard.
           WRAP="$RUNNER_TEMP/legacycc"
           mkdir -p "$WRAP"
+
           for c in cc gcc; do
             printf '#!/bin/sh\nexec /usr/bin/%s -std=gnu17 "$@"\n' "$c" > "$WRAP/$c"
             chmod +x "$WRAP/$c"
           done
+
           PATH="$WRAP:$PATH" make -C uefi/MU_BASECORE/BaseTools/Source/C -j8 \
             EXTRA_OPTFLAGS="-Wno-error -std=gnu17"
+
           ls -l uefi/MU_BASECORE/BaseTools/Source/C/bin/GenFw
 
       - name: Seed the EDK II Conf directory with relaxed clang flags
@@ -224,10 +361,13 @@ jobs:
           # tools_def.txt here is what the build ends up using.
           CONF=out/raphael/edk2-conf
           TPL=uefi/MU_BASECORE/BaseTools/Conf
+
           mkdir -p "$CONF"
+
           for n in target tools_def build_rule; do
             [ -f "$CONF/$n.txt" ] || cp "$TPL/$n.template" "$CONF/$n.txt"
           done
+
           python3 scripts/relax_clang.py "$CONF/tools_def.txt"
           grep -n "_CLANGPDB_AARCH64_CC_FLAGS" "$CONF/tools_def.txt" | head -3
 
@@ -256,9 +396,11 @@ jobs:
         if: failure()
         run: |
           ls -la out/raphael/logs/ 2>/dev/null || true
+
           for f in out/raphael/logs/*.log; do
             [ -f "$f" ] || continue
-            echo "----- $f -----"; tail -n 60 "$f"
+            echo "----- $f -----"
+            tail -n 60 "$f"
           done
 
       - uses: actions/upload-artifact@v4
